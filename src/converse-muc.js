@@ -202,6 +202,8 @@
                     this.occupantsview.chatroomview = this;
                     this.render().$el.hide();
                     this.occupantsview.model.fetch({add:true});
+                    _.each(['member', 'owner', 'admin'], this.fetchMembersList.bind(this));
+
                     this.join(null, {'maxstanzas': converse.muc_history_max_stanzas});
                     this.fetchMessages().insertIntoDOM();
                     // XXX: adding the event below to the events map above doesn't work.
@@ -252,6 +254,34 @@
                     converse.connection.deleteHandler(this.handler);
                     this.leave();
                     converse.ChatBoxView.prototype.close.apply(this, arguments);
+                },
+
+                fetchMembersList: function (affiliation) {
+                    /*
+                    <iq from='crone1@shakespeare.lit/desktop'
+                        id='member3'
+                        to='coven@chat.shakespeare.lit'
+                        type='get'>
+                        <query xmlns='http://jabber.org/protocol/muc#admin'>
+                            <item affiliation='member'/>
+                        </query>
+                    </iq>
+                    */
+                    var iq = $iq({
+                        'to': this.model.get('jid'),
+                        'type': "get",
+                        'from': converse.connection.jid
+                    }).c("query", {'xmlns': Strophe.NS.MUC_ADMIN})
+                        .c("item", {'affiliation': affiliation});
+                    return converse.connection.sendIQ(
+                        iq.tree(),
+                        this.occupantsview.updateOccupantsOnMembersList.bind(this.occupantsview),
+                        this.onMembersListError.bind(this)
+                    );
+                },
+
+                onMembersListError: function (iq) {
+                    converse.log("Could not retrieve members list for "+this.model.get('jid'), "error");
                 },
 
                 toggleOccupants: function (ev, preserve_state) {
@@ -617,7 +647,45 @@
                 },
 
                 onConfigSaved: function (stanza) {
-                    // TODO: provide feedback
+                    /* If the config has been changed to make the room "members
+                     * only", then we now set the current occupants as the
+                     * members list (which is initially empty).
+                     */
+                    /*
+                        <iq from='crone1@shakespeare.lit/desktop'
+                            id='member4'
+                            to='coven@chat.shakespeare.lit'
+                            type='set'>
+                        <query xmlns='http://jabber.org/protocol/muc#admin'>
+                            <item affiliation='none'
+                                jid='hag66@shakespeare.lit'/>
+                            <item affiliation='member'
+                                jid='hecate@shakespeare.lit'/>
+                        </query>
+                        </iq>
+                    */
+                    var iq = $iq({'to':this.model.get('jid'), 'type':'set', 'from':converse.connection.jid})
+                        .c("query", {'xmlns': Strophe.NS.MUC_ADMIN});
+                    this.occupantsview.model.each(function (occupant) {
+                        var affiliation = occupant.get('affiliation');
+                        iq.c('item', {
+                                'affiliation': affiliation !== 'none' ? affiliation : 'member',
+                                'jid': Strophe.getBareJidFromJid(occupant.get('jid'))
+                            });
+                    });
+                    return converse.connection.sendIQ(
+                        iq.tree(),
+                        this.onMembersListChanged.bind(this),
+                        this.onMembersListChangedError.bind(this)
+                    );
+                },
+
+                onMembersListChanged: function (stanza) {
+                    converse.log("Members list for "+this.model.get('jid')+" has been succesfully updated");
+                },
+
+                onMembersListChangedError: function (stanza) {
+                    this.showStatusNotification(__("An error occurred while trying to update the members list."));
                 },
 
                 onErrorConfigSaved: function (stanza) {
@@ -936,12 +1004,13 @@
                 },
                 render: function () {
                     var $new = converse.templates.occupant(
-                        _.extend(
-                            this.model.toJSON(), {
-                                'desc_moderator': __('This user is a moderator'),
-                                'desc_occupant': __('This user can send messages in this room'),
-                                'desc_visitor': __('This user can NOT send messages in this room')
-                        })
+                        _.extend({
+                            'nick': this.model.get('jid'),
+                            'role': null,
+                            'desc_moderator': __('This user is a moderator'),
+                            'desc_occupant': __('This user can send messages in this room'),
+                            'desc_visitor': __('This user can NOT send messages in this room')
+                            }, this.model.toJSON())
                     );
                     this.$el.replaceWith($new);
                     this.setElement($new, true);
@@ -980,9 +1049,9 @@
                 },
 
                 onOccupantAdded: function (item) {
-                    var view = this.get(item.get('id'));
+                    var view = this.get(item.get('jid'));
                     if (!view) {
-                        view = this.add(item.get('id'), new converse.ChatRoomOccupantView({model: item}));
+                        view = this.add(item.get('jid'), new converse.ChatRoomOccupantView({model: item}));
                     } else {
                         delete view.model; // Remove ref to old model to help garbage collection
                         view.model = item;
@@ -994,7 +1063,6 @@
                 parsePresence: function (pres) {
                     var id = Strophe.getResourceFromJid(pres.getAttribute("from"));
                     var data = {
-                        id: id,
                         nick: id,
                         type: pres.getAttribute("type"),
                         states: []
@@ -1030,23 +1098,58 @@
                 },
 
                 updateOccupantsOnPresence: function (pres) {
-                    var occupant;
+                    var occupant, attributes;
                     var data = this.parsePresence(pres);
+                    var jid = Strophe.getBareJidFromJid(data.jid);
                     switch (data.type) {
                         case 'error':
                             return true;
                         case 'unavailable':
-                            occupant = this.model.get(data.id);
-                            if (occupant) { occupant.destroy(); }
+                            occupant = this.model.where({'jid': jid}).pop();
+                            if (occupant) { occupant[0].destroy(); }
                             break;
                         default:
-                            occupant = this.model.get(data.id);
+                            occupant = this.model.where({'jid': jid}).pop();
+                            attributes = _.extend(data, {
+                                'jid': jid,
+                                'resource': Strophe.getResourceFromJid(data.jid),
+                                'online': true
+                            });
                             if (occupant) {
-                                occupant.save(data);
+                                occupant.save(attributes);
                             } else {
-                                this.model.create(data);
+                                this.model.create(attributes);
                             }
                     }
+                },
+
+                updateOccupantsOnMembersList: function (iq) {
+                    /* <iq from='coven@chat.shakespeare.lit'
+                            id='member3'
+                            to='crone1@shakespeare.lit/desktop'
+                            type='result'>
+                        <query xmlns='http://jabber.org/protocol/muc#admin'>
+                            <item affiliation='member'
+                                jid='hag66@shakespeare.lit'
+                                nick='thirdwitch'
+                                role='participant'/>
+                        </query>
+                        </iq>
+                    */
+                    _.each($(iq).find('query item'), function (item) {
+                        var jid = item.getAttribute('jid');
+                        var occupant = this.model.where({'jid': jid}).pop();
+                        var data = {
+                            'jid': item.getAttribute('jid'),
+                            'affiliation': item.getAttribute('affiliation')
+                        };
+                        if (occupant) {
+                            occupant.save(data);
+                        } else {
+                            this.model.create(data);
+                        }
+                    }.bind(this));
+                    return;
                 },
 
                 initInviteWidget: function () {
